@@ -1,2 +1,2 @@
 # group7par
-PAR project repo
+PAR projectrepo
