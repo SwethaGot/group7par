@@ -22,6 +22,7 @@ setup(
         'console_scripts': [
             'waypoint_finder = vision_to_waypoint_pkg.waypoint_finder:main',
             'go_home_node = vision_to_waypoint_pkg.go_home_node:main',
+            'go_to_object = vision_to_waypoint_pkg.go_to_object:main',
         ],
     },
 )
