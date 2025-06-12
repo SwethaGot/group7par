@@ -1,0 +1,32 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>vision_to_waypoint_pkg</name>
+  <version>0.0.0</version>
+  <description>ROS2 package to detect an object and move the UR5e arm to its position using vision and MoveIt.</description>
+  <maintainer email="vxlab@urbrain.vx.rmit.edu.au">rosuser</maintainer>
+  <license>MIT</license>
+
+  <!-- Core ROS 2 Python -->
+  <exec_depend>rclpy</exec_depend>
+
+  <!-- Messages -->
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+
+  <!-- TF2 -->
+  <exec_depend>tf2_ros</exec_depend>
+
+  <!-- MoveIt -->
+  <exec_depend>moveit_commander</exec_depend>
+
+  <!-- Optional tools for building/testing -->
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
