@@ -23,6 +23,8 @@ setup(
             'waypoint_finder = vision_to_waypoint_pkg.waypoint_finder:main',
             'go_home_node = vision_to_waypoint_pkg.go_home_node:main',
             'go_to_object = vision_to_waypoint_pkg.go_to_object:main',
+            'go_to_hover_test = vision_to_waypoint_pkg.go_to_hover_test:main',
+            'test_move = vision_to_waypoint_pkg.test_move:main'
         ],
     },
 )

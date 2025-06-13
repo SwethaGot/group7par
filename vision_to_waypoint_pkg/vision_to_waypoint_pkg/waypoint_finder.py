@@ -24,7 +24,7 @@ class WaypointFinder(Node):
         if self.has_logged:
             return
 
-        object_frame = "object_21"
+        object_frame = "object_22"
         try:
             # Lookup object pose from TF
             trans = self.tf_buffer.lookup_transform(
