@@ -1,0 +1,21 @@
+# UR5e Board Game Hand Safety System - Ubuntu Dependencies
+# Flask Web + Hand Detection + Streaming
+
+# Web framework & real-time sockets
+flask==2.3.3
+flask-socketio==5.3.6
+flask-cors==4.0.0
+python-socketio==5.9.0
+eventlet==0.33.3
+
+# Computer vision
+opencv-python==4.8.1.78
+mediapipe==0.10.7
+
+# Utility and communication
+requests==2.31.0
+numpy==1.24.3
+
+# Build tools (for pip installing packages cleanly)
+setuptools>=65.0.0
+wheel
