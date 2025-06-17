@@ -15,6 +15,18 @@ app.config['SECRET_KEY'] = 'ur5e_boardgame_secret'
 socketio = SocketIO(app, cors_allowed_origins="*", logger=True, engineio_logger=True)
 
 # Global state variables
+
+import base64
+import threading
+import time
+from datetime import datetime
+
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import Image
+from cv_bridge import CvBridge
+import cv2
+
 robot_state = {
     'safety_status': 'safe',
     'hazard_detected': False,
@@ -22,6 +34,77 @@ robot_state = {
     'game_state': 'waiting',
     'camera_fps': 0
 }
+
+class CameraStreamer(Node):
+    def __init__(self):
+        super().__init__('web_camera_streamer')
+        self.bridge = CvBridge()
+        self.frame = None
+        self.lock = threading.Lock()
+        self.subscription = self.create_subscription(
+            Image,
+            '/camera/camera/color/image_raw',
+            self.image_callback,
+            10
+        )
+
+    def image_callback(self, msg):
+        try:
+            img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            ret, jpeg = cv2.imencode('.jpg', img)
+            if ret:
+                with self.lock:
+                    self.frame = jpeg.tobytes()
+        except Exception as e:
+            self.get_logger().error(f"Camera callback error: {e}")
+
+    def get_encoded_frame(self):
+        with self.lock:
+            return base64.b64encode(self.frame).decode('utf-8') if self.frame else None
+
+    def get_jpeg_frame(self):
+        with self.lock:
+            return self.frame
+
+rclpy.init()
+camera_node = CameraStreamer()
+threading.Thread(target=rclpy.spin, args=(camera_node,), daemon=True).start()
+
+# Emit camera_frame over WebSocket
+def emit_frames():
+    fps_counter = 0
+    start_time = time.time()
+    while True:
+        frame_b64 = camera_node.get_encoded_frame()
+        if frame_b64:
+            socketio.emit('camera_frame', {'frame': frame_b64})
+            fps_counter += 1
+        time.sleep(1.0 / 30.0)
+        if time.time() - start_time >= 1.0:
+            robot_state['camera_fps'] = fps_counter
+            fps_counter = 0
+            start_time = time.time()
+            socketio.emit('status_update', robot_state)
+
+threading.Thread(target=emit_frames, daemon=True).start()
+
+@app.route('/video_feed')
+def video_feed():
+    def generate():
+        while True:
+            frame = camera_node.get_jpeg_frame()
+            if frame:
+                yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + frame + b'\r\n\r\n')
+            time.sleep(1.0 / 30.0)
+    return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+    robot_state = {
+        'safety_status': 'safe',
+        'hazard_detected': False,
+        'robot_mode': 'idle',
+        'game_state': 'waiting',
+        'camera_fps': 0
+    }
 
 # Hand detection setup
 mp_hands = mp.solutions.hands
