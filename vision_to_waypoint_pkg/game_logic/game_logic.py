@@ -24,9 +24,6 @@ class GameBoard:
         self.grid = [['' for _ in range(self.cols)] for _ in range(self.rows)]
         self.label_map = [['' for _ in range(self.cols)] for _ in range(self.rows)]
 
-    def place_piece(self, i, j, player, label):
-        self.board.grid[i][j] = player.symbol
-        self.buttons[i][j].config(text=label, bg=player.color, state='disabled')
 
 def check_win(board, symbol):
     g = board.grid
