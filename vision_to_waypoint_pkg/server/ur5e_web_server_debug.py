@@ -1,850 +1,710 @@
 from flask import Flask, render_template_string, jsonify, request, Response, send_file
-from flask_socketio import SocketIO, emit
-import json
 import time
 import threading
 import cv2
-import mediapipe as mp
+import os
 import numpy as np
 from datetime import datetime
-import base64
-import os
+from ultralytics import YOLO
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'ur5e_boardgame_secret'
-socketio = SocketIO(app, cors_allowed_origins="*", logger=True, engineio_logger=True)
 
-# Global state variables
-
-import base64
-import threading
-import time
-from datetime import datetime
-
-import rclpy
-from rclpy.node import Node
-from sensor_msgs.msg import Image
-from cv_bridge import CvBridge
-import cv2
-
-robot_state = {
-    'safety_status': 'safe',
+# Global system state
+system_state = {
+    'detection_enabled': False,
     'hazard_detected': False,
-    'robot_mode': 'idle',
-    'game_state': 'waiting',
-    'camera_fps': 0
+    'safety_status': 'idle',
+    'camera_fps': 0,
+    'hazards_detected': 0,
+    'last_update': datetime.now().isoformat(),
+    'logs': []
 }
 
-class CameraStreamer(Node):
+class HandDetectionSystem:
     def __init__(self):
-        super().__init__('web_camera_streamer')
-        self.bridge = CvBridge()
         self.frame = None
+        self.processed_frame = None
         self.lock = threading.Lock()
-        self.subscription = self.create_subscription(
-            Image,
-            '/camera/camera/color/image_raw',
-            self.image_callback,
-            10
-        )
-
-    def image_callback(self, msg):
-        try:
-            img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-            ret, jpeg = cv2.imencode('.jpg', img)
-            if ret:
-                with self.lock:
-                    self.frame = jpeg.tobytes()
-        except Exception as e:
-            self.get_logger().error(f"Camera callback error: {e}")
-
-    def get_encoded_frame(self):
-        with self.lock:
-            return base64.b64encode(self.frame).decode('utf-8') if self.frame else None
-
-    def get_jpeg_frame(self):
-        with self.lock:
-            return self.frame
-
-rclpy.init()
-camera_node = CameraStreamer()
-threading.Thread(target=rclpy.spin, args=(camera_node,), daemon=True).start()
-
-# Emit camera_frame over WebSocket
-def emit_frames():
-    fps_counter = 0
-    start_time = time.time()
-    while True:
-        frame_b64 = camera_node.get_encoded_frame()
-        if frame_b64:
-            socketio.emit('camera_frame', {'frame': frame_b64})
-            fps_counter += 1
-        time.sleep(1.0 / 30.0)
-        if time.time() - start_time >= 1.0:
-            robot_state['camera_fps'] = fps_counter
-            fps_counter = 0
-            start_time = time.time()
-            socketio.emit('status_update', robot_state)
-
-threading.Thread(target=emit_frames, daemon=True).start()
-
-@app.route('/video_feed')
-def video_feed():
-    def generate():
-        while True:
-            frame = camera_node.get_jpeg_frame()
-            if frame:
-                yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + frame + b'\r\n\r\n')
-            time.sleep(1.0 / 30.0)
-    return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
-
-    robot_state = {
-        'safety_status': 'safe',
-        'hazard_detected': False,
-        'robot_mode': 'idle',
-        'game_state': 'waiting',
-        'camera_fps': 0
-    }
-
-# Hand detection setup
-mp_hands = mp.solutions.hands
-hands = mp_hands.Hands(
-    static_image_mode=False,
-    max_num_hands=2,
-    min_detection_confidence=0.7,
-    min_tracking_confidence=0.5
-)
-
-class HandSafetyMonitor:
-    def __init__(self):
-        self.hazard_active = False
-        self.last_detection_time = 0
-        self.camera_active = False
         self.cap = None
-        self.latest_frame = None
-        self.frame_lock = threading.Lock()
-        self.frame_count = 0
+        self.running = False
+        self.fps_counter = 0
+        self.fps_start = time.time()
         
-    def start_monitoring(self):
-        """Start the hand detection in a separate thread"""
-        if not self.camera_active:
-            self.camera_active = True
-            self.monitoring_thread = threading.Thread(target=self._monitor_loop, daemon=True)
-            self.monitoring_thread.start()
-            print("🛡️ Hand safety monitoring started")
-            self._emit_log("System Started", "Monitoring activated", "success")
-    
-    def stop_monitoring(self):
-        """Stop the hand detection"""
-        self.camera_active = False
-        if self.cap:
-            self.cap.release()
-        print("🛑 Hand safety monitoring stopped")
-    
-    def _emit_log(self, title, message, type="info"):
-        """Emit log message to web interface"""
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        socketio.emit('log_message', {
-            'timestamp': timestamp,
-            'title': title,
-            'message': message,
-            'type': type  # success, warning, error, info
-        })
-    
-    def _monitor_loop(self):
-        """Main monitoring loop with better debugging"""
+        # Detection state
+        self.model = None
+        self.detection_enabled = False
+        self.hazard_active = False
+        self.last_alert_time = 0
+        
+        self.load_yolo_model()
+        self.start_camera()
+
+    def load_yolo_model(self):
+        """Load YOLOv8s model"""
+        try:
+            model_path = 'yolov8s.pt'
+            if os.path.exists(model_path):
+                print(f"✅ Loading YOLOv8s model from {model_path}")
+                self.model = YOLO(model_path)
+                print("✅ YOLOv8s model loaded successfully")
+            else:
+                print("📥 Downloading YOLOv8s model...")
+                self.model = YOLO('yolov8s.pt')
+                print("✅ YOLOv8s model downloaded and loaded")
+        except Exception as e:
+            print(f"❌ Failed to load YOLOv8s model: {e}")
+            self.model = None
+
+    def start_camera(self):
+        """Start camera capture"""
         try:
             self.cap = cv2.VideoCapture(0)
-            
-            # Optimize camera settings
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
             self.cap.set(cv2.CAP_PROP_FPS, 30)
-            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             
-            fps_counter = 0
-            fps_start = time.time()
-            
-            print("✅ Camera initialized - streaming via WebSocket")
-            self._emit_log("Camera Ready", "Live feed streaming started", "success")
-            
-            while self.camera_active:
-                ret, frame = self.cap.read()
-                if not ret:
-                    print("⚠️ Failed to read camera frame")
-                    continue
-                
-                # Store latest frame
-                with self.frame_lock:
-                    self.latest_frame = frame.copy()
-                    
-                # Detect hands
-                hands_detected = self._detect_hands(frame)
-                
-                # Update safety status
-                if hands_detected and not self.hazard_active:
-                    self._trigger_hazard()
-                elif not hands_detected and self.hazard_active:
-                    self._clear_hazard()
-                
-                # Emit frame EVERY frame for debugging (we'll reduce later if needed)
-                self.frame_count += 1
-                if self.frame_count % 2 == 0:  # Every 2nd frame
-                    success = self._emit_frame(frame)
-                    if not success and self.frame_count % 60 == 0:  # Log error every 60 frames
-                        print(f"⚠️ Frame emission failed at frame {self.frame_count}")
-                
-                # Calculate FPS
-                fps_counter += 1
-                if time.time() - fps_start >= 1.0:
-                    robot_state['camera_fps'] = fps_counter
-                    fps_counter = 0
-                    fps_start = time.time()
-                    
-                    # Emit status update
-                    socketio.emit('status_update', robot_state)
-                    
-                    # Debug log every second
-                    if self.frame_count % 30 == 0:
-                        print(f"📹 Streaming: {robot_state['camera_fps']} FPS, Frame #{self.frame_count}")
-                
-                time.sleep(0.033)  # ~30 FPS
-                
-        except Exception as e:
-            print(f"⚠️ Camera monitoring error: {e}")
-            self._emit_log("Camera Error", str(e), "error")
-        finally:
-            if self.cap:
-                self.cap.release()
-    
-    def _emit_frame(self, frame):
-        """Emit camera frame to web interface via WebSocket"""
-        try:
-            # Add overlay if hazard
-            display_frame = frame.copy()
-            if self.hazard_active:
-                overlay = display_frame.copy()
-                cv2.rectangle(overlay, (0, 0), (640, 480), (0, 0, 255), 10)
-                cv2.putText(overlay, "HAZARD DETECTED", (50, 250), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 255), 3)
-                display_frame = cv2.addWeighted(overlay, 0.3, display_frame, 0.7, 0)
-            
-            # Encode to base64
-            ret, buffer = cv2.imencode('.jpg', display_frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
-            if ret:
-                frame_b64 = base64.b64encode(buffer).decode('utf-8')
-                # Emit to all connected clients
-                socketio.emit('camera_frame', {'frame': frame_b64})
-                return True
+            if self.cap.isOpened():
+                self.running = True
+                self.thread = threading.Thread(target=self.camera_loop, daemon=True)
+                self.thread.start()
+                print("✅ Camera started")
             else:
-                print("❌ Failed to encode frame")
-                return False
+                print("❌ Camera failed to open")
+        except Exception as e:
+            print(f"❌ Camera error: {e}")
+
+    def detect_hands(self, frame):
+        """Detect hands using YOLO person detection"""
+        if not self.model or not self.detection_enabled:
+            return frame, []
+        
+        try:
+            results = self.model(frame, verbose=False)
+            hazards = []
+            
+            for result in results:
+                if result.boxes is not None:
+                    for box in result.boxes:
+                        class_id = int(box.cls[0])
+                        confidence = float(box.conf[0])
+                        
+                        # Person class = 0, treat as hand hazard if confidence > 0.5 (lowered for better model)
+                        if class_id == 0 and confidence > 0.5:  # Lowered from 0.6 since better model
+                            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                            x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+                            
+                            # Draw RED detection box for hand hazard
+                            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 4)
+                            cv2.putText(frame, f"HAZARD: HANDS {confidence:.2f}", 
+                                       (x1, y1-15), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                            
+                            hazards.append({
+                                'type': 'hands',
+                                'confidence': confidence,
+                                'bbox': [x1, y1, x2, y2]
+                            })
+            
+            return frame, hazards
             
         except Exception as e:
-            print(f"Frame emission error: {e}")
-            return False
-    
-    def _detect_hands(self, frame):
-        """Detect hands in frame"""
-        try:
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = hands.process(rgb_frame)
-            return results.multi_hand_landmarks is not None
-        except:
-            return False
-    
-    def _trigger_hazard(self):
-        """Trigger hazard alert"""
+            print(f"Detection error: {e}")
+            return frame, []
+
+    def add_status_overlay(self, frame):
+        """Add status overlay to frame"""
+        height, width = frame.shape[:2]
+        
+        if not self.detection_enabled:
+            # Detection disabled - blue border
+            cv2.rectangle(frame, (0, 0), (width, height), (255, 255, 0), 3)
+            cv2.putText(frame, "DETECTION DISABLED - CLICK START", (20, 50),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
+        elif self.hazard_active:
+            # Hazard detected - red border
+            cv2.rectangle(frame, (0, 0), (width, height), (0, 0, 255), 8)
+            cv2.putText(frame, "HAND HAZARD DETECTED", (20, 50),
+                       cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
+        else:
+            # Monitoring active - green border
+            cv2.rectangle(frame, (0, 0), (width, height), (0, 255, 0), 3)
+            cv2.putText(frame, "HAND MONITORING ACTIVE", (20, 50),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+        
+        # Info overlay
+        cv2.putText(frame, "GROUP 07 - HAND DETECTION", (width-280, height-50),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(frame, f"FPS: {system_state['camera_fps']}", (20, height-50),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(frame, f"Hazards: {system_state['hazards_detected']}", (20, height-25),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        
+        return frame
+
+    def trigger_hazard(self, hazards):
+        """Trigger hazard protocol"""
         current_time = time.time()
-        if current_time - self.last_detection_time < 1.0:
+        
+        if current_time - self.last_alert_time < 2.0:
             return
-            
+        
         self.hazard_active = True
-        self.last_detection_time = current_time
+        self.last_alert_time = current_time
         
-        # Update global state
-        robot_state['hazard_detected'] = True
-        robot_state['safety_status'] = 'hazard'
-        robot_state['robot_mode'] = 'stopped'
-        robot_state['game_state'] = 'hazard_stop'
+        timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
         
-        # Log hazard
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        print(f"\n🚨 HAZARD DETECTED at {timestamp}")
-        print("🛑 HAZARD.. STOPPING")
-        print("✋ Human hand detected in work area!")
+        print(f"\n🚨 ===== HAND HAZARD DETECTED ===== 🚨")
+        print(f"⏰ {timestamp}")
+        print(f"🛑 ROBOT EMERGENCY STOP")
+        print(f"✋ {len(hazards)} HAND HAZARD(S) DETECTED")
         
-        # Emit to web interface
-        socketio.emit('hazard_alert', {
-            'type': 'hazard_detected',
-            'message': 'Hand detected - Robot stopped',
-            'timestamp': timestamp
-        })
+        for i, hazard in enumerate(hazards):
+            print(f"   Hazard {i+1}: {hazard['confidence']:.2f} confidence")
         
-        # Emit beautiful log
-        self._emit_log("⚠️ HAZARD DETECTED", "Human hand in work area - Robot stopped", "error")
-    
-    def _clear_hazard(self):
-        """Clear hazard when area is safe"""
+        print(f"🚨 ========================= 🚨\n")
+        
+        # Update system state
+        system_state['hazard_detected'] = True
+        system_state['safety_status'] = 'hazard'
+        system_state['hazards_detected'] = len(hazards)
+        system_state['last_update'] = datetime.now().isoformat()
+        
+        # Add to logs
+        self.add_log('🚨 HAND HAZARD', f'{len(hazards)} hand hazard(s) detected', 'error')
+
+    def clear_hazard(self):
+        """Clear hazard when safe"""
         if not self.hazard_active:
             return
-            
+        
         self.hazard_active = False
-        
-        # Update global state
-        robot_state['hazard_detected'] = False
-        robot_state['safety_status'] = 'safe'
-        robot_state['robot_mode'] = 'idle'
-        robot_state['game_state'] = 'waiting'
-        
-        # Log clearance
         timestamp = datetime.now().strftime("%H:%M:%S")
-        print(f"✅ [{timestamp}] SAFETY ALL CLEAR")
-        print("🟢 Work area secure")
         
-        # Emit to web interface
-        socketio.emit('hazard_clear', {
-            'type': 'hazard_cleared',
-            'message': 'Area secure',
-            'timestamp': timestamp
-        })
+        print(f"✅ [{timestamp}] AREA CLEAR - SAFE TO CONTINUE")
         
-        # Emit beautiful log
-        self._emit_log("✅ ALL CLEAR", "Work area secure - Operations resumed", "success")
+        # Update system state
+        system_state['hazard_detected'] = False
+        system_state['safety_status'] = 'safe'
+        system_state['hazards_detected'] = 0
+        system_state['last_update'] = datetime.now().isoformat()
+        
+        # Add to logs
+        self.add_log('✅ Area Clear', 'Work area secure - no hands detected', 'success')
 
-# Initialize hand safety monitor
-safety_monitor = HandSafetyMonitor()
+    def start_detection(self):
+        """Start detection monitoring"""
+        self.detection_enabled = True
+        system_state['detection_enabled'] = True
+        system_state['safety_status'] = 'monitoring'
+        system_state['last_update'] = datetime.now().isoformat()
+        print("🛡️ Hand detection monitoring STARTED")
+        self.add_log('🛡️ Detection Started', 'Hand detection monitoring activated', 'success')
+        
+    def stop_detection(self):
+        """Stop detection monitoring"""
+        self.detection_enabled = False
+        self.hazard_active = False
+        system_state['detection_enabled'] = False
+        system_state['hazard_detected'] = False
+        system_state['safety_status'] = 'idle'
+        system_state['hazards_detected'] = 0
+        system_state['last_update'] = datetime.now().isoformat()
+        print("🛑 Hand detection monitoring STOPPED")
+        self.add_log('🛑 Detection Stopped', 'Hand detection monitoring disabled', 'warning')
 
-# Route to serve gameboard images
+    def add_log(self, title, message, type_='info'):
+        """Add log entry"""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        log_entry = {
+            'timestamp': timestamp,
+            'title': title,
+            'message': message,
+            'type': type_
+        }
+        system_state['logs'].insert(0, log_entry)
+        
+        # Keep only last 50 logs
+        if len(system_state['logs']) > 50:
+            system_state['logs'] = system_state['logs'][:50]
+
+    def camera_loop(self):
+        """Main camera loop"""
+        while self.running and self.cap and self.cap.isOpened():
+            try:
+                ret, frame = self.cap.read()
+                if ret:
+                    # Store original frame
+                    with self.lock:
+                        self.frame = frame.copy()
+                    
+                    # Run detection
+                    detected_frame, hazards = self.detect_hands(frame.copy())
+                    
+                    # Handle hazard state
+                    if self.detection_enabled:
+                        if len(hazards) > 0:
+                            self.trigger_hazard(hazards)
+                        else:
+                            self.clear_hazard()
+                    
+                    # Add status overlay
+                    final_frame = self.add_status_overlay(detected_frame)
+                    
+                    # Encode for streaming
+                    ret_encode, jpeg = cv2.imencode('.jpg', final_frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                    if ret_encode:
+                        with self.lock:
+                            self.processed_frame = jpeg.tobytes()
+                    
+                    # Update FPS
+                    self.fps_counter += 1
+                    if time.time() - self.fps_start >= 1.0:
+                        system_state['camera_fps'] = self.fps_counter
+                        self.fps_counter = 0
+                        self.fps_start = time.time()
+                            
+                time.sleep(0.033)  # ~30 FPS
+                
+            except Exception as e:
+                print(f"⚠️ Camera error: {e}")
+                time.sleep(0.1)
+
+    def get_frame(self):
+        """Get latest processed frame"""
+        with self.lock:
+            return self.processed_frame
+
+    def stop(self):
+        """Stop camera"""
+        self.running = False
+        if self.cap:
+            self.cap.release()
+
+# Initialize detection system
+detector = HandDetectionSystem()
+
 @app.route('/gameboard-<int:num>.png')
 def serve_gameboard(num):
-    """Serve gameboard images from current directory"""
+    """Serve gameboard images"""
     try:
         filename = f'gameboard-{num}.png'
         if os.path.exists(filename):
             return send_file(filename, mimetype='image/png')
-        else:
-            print(f"⚠️ Image not found: {filename}")
-            return Response('', status=404)
-    except Exception as e:
-        print(f"❌ Error serving gameboard image: {e}")
-        return Response('', status=404)
+        return Response('Image not found', status=404)
+    except:
+        return Response('Error', status=404)
 
-# HTML template with LIVE LOGS and fixed camera
-HTML_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>UR5e Board Game Safety System - Group 07</title>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        
-        body { 
-            font-family: 'SF Pro Display', -apple-system, BlinkMacSystemFont, sans-serif;
-            background: #000000; color: #ffffff; min-height: 100vh; overflow-x: hidden;
-        }
-        
-        .header { 
-            text-align: center; padding: 20px; background: #111111;
-            border-bottom: 1px solid #333333; position: relative;
-        }
-        
-        .header h1 { 
-            font-size: 2rem; font-weight: 300; margin-bottom: 5px;
-            color: #ffffff; letter-spacing: 2px;
-        }
-        
-        .header .subtitle { 
-            font-size: 0.9rem; color: #888888; font-weight: 300;
-        }
-        
-        .group-badge {
-            position: absolute; top: 20px; right: 20px;
-            background: #ffffff; color: #000000; padding: 8px 16px;
-            border-radius: 20px; font-weight: 600; font-size: 0.8rem;
-            letter-spacing: 1px;
-        }
-        
-        .main-container {
-            display: grid; grid-template-columns: 1fr 1fr 300px; gap: 1px;
-            min-height: calc(100vh - 150px); background: #333333;
-        }
-        
-        .section {
-            background: #000000; padding: 30px; display: flex;
-            flex-direction: column; align-items: center; justify-content: center;
-        }
-        
-        .section-title {
-            font-size: 1.2rem; font-weight: 300; margin-bottom: 20px;
-            color: #ffffff; letter-spacing: 1px; text-align: center;
-        }
-        
-        /* Game Board Section */
-        .gameboard-frame {
-            width: 100%; max-width: 400px; 
-            background: #ffffff;
-            border-radius: 15px; 
-            padding: 20px;
-            box-shadow: 0 4px 20px rgba(255, 255, 255, 0.1);
-        }
-        
-        .gameboard-container {
-            width: 100%; background: #000000;
-            border-radius: 10px; overflow: hidden;
-            display: flex; flex-direction: column;
-        }
-        
-        .gameboard-half {
-            width: 100%; height: auto; display: block;
-        }
-        
-        .gameboard-spacer {
-            height: 8px;
-            background: #ffffff;
-        }
-        
-        .image-error {
-            width: 100%; height: 150px; background: #222222;
-            border: 1px solid #444444; border-radius: 5px;
-            display: flex; align-items: center; justify-content: center;
-            color: #666666; font-size: 0.8rem; margin: 2px 0;
-        }
-        
-        /* Camera Feed Section */
-        .camera-container {
-            width: 100%; max-width: 400px; background: #111111;
-            border-radius: 10px; overflow: hidden; border: 1px solid #333333;
-            position: relative;
-        }
-        
-        .camera-feed {
-            width: 100%; height: auto; display: block;
-        }
-        
-        .camera-status {
-            position: absolute; top: 10px; left: 10px;
-            background: rgba(0, 0, 0, 0.7); padding: 5px 10px;
-            border-radius: 5px; font-size: 0.8rem; color: #ffffff;
-        }
-        
-        .camera-status.live {
-            background: rgba(0, 255, 0, 0.7);
-        }
-        
-        .camera-status.hazard {
-            background: rgba(255, 0, 0, 0.7);
-            animation: pulse 1s infinite;
-        }
-        
-        .camera-placeholder {
-            width: 100%; height: 300px; background: #111111;
-            border: 1px solid #333333; border-radius: 10px;
-            display: flex; align-items: center; justify-content: center;
-            color: #666666; font-size: 0.9rem; flex-direction: column; gap: 10px;
-        }
-        
-        /* LIVE LOGS SECTION */
-        .logs-section {
-            background: #000000; padding: 20px; display: flex;
-            flex-direction: column; max-height: calc(100vh - 150px); overflow: hidden;
-        }
-        
-        .logs-header {
-            font-size: 1rem; font-weight: 300; margin-bottom: 15px;
-            color: #ffffff; letter-spacing: 1px; text-align: center;
-            border-bottom: 1px solid #333333; padding-bottom: 10px;
-        }
-        
-        .logs-container {
-            flex: 1; overflow-y: auto; display: flex; flex-direction: column-reverse;
-            scrollbar-width: thin; scrollbar-color: #333333 #000000;
-        }
-        
-        .logs-container::-webkit-scrollbar {
-            width: 6px;
-        }
-        
-        .logs-container::-webkit-scrollbar-track {
-            background: #000000;
-        }
-        
-        .logs-container::-webkit-scrollbar-thumb {
-            background: #333333;
-            border-radius: 3px;
-        }
-        
-        .log-entry {
-            margin-bottom: 10px; padding: 12px; border-radius: 8px;
-            border-left: 3px solid; font-size: 0.85rem; line-height: 1.4;
-            animation: slideIn 0.3s ease-out;
-        }
-        
-        .log-entry.success {
-            background: rgba(0, 255, 0, 0.1); border-color: #00ff00; color: #ccffcc;
-        }
-        
-        .log-entry.error {
-            background: rgba(255, 0, 0, 0.1); border-color: #ff0000; color: #ffcccc;
-        }
-        
-        .log-entry.warning {
-            background: rgba(255, 255, 0, 0.1); border-color: #ffff00; color: #ffffcc;
-        }
-        
-        .log-entry.info {
-            background: rgba(0, 150, 255, 0.1); border-color: #0096ff; color: #ccddff;
-        }
-        
-        .log-timestamp {
-            font-size: 0.75rem; opacity: 0.7; float: right;
-        }
-        
-        .log-title {
-            font-weight: 600; margin-bottom: 2px;
-        }
-        
-        .log-message {
-            opacity: 0.9;
-        }
-        
-        @keyframes slideIn {
-            from { opacity: 0; transform: translateX(20px); }
-            to { opacity: 1; transform: translateX(0); }
-        }
-        
-        @keyframes pulse { 0%, 100% { opacity: 0.7; } 50% { opacity: 1; } }
-        
-        /* Status Panel */
-        .status-panel {
-            position: fixed; bottom: 0; left: 0; right: 0;
-            background: #111111; border-top: 1px solid #333333;
-            padding: 15px; display: flex; justify-content: space-between;
-            align-items: center; z-index: 1000;
-        }
-        
-        .status-left, .status-right {
-            display: flex; align-items: center; gap: 20px;
-        }
-        
-        .status-indicator {
-            width: 10px; height: 10px; border-radius: 50%;
-            background: #00ff00; animation: blink 2s infinite;
-        }
-        
-        .status-indicator.hazard {
-            background: #ff0000; animation: fastBlink 0.5s infinite;
-        }
-        
-        @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
-        @keyframes fastBlink { 0%, 100% { opacity: 1; } 50% { opacity: 0.1; } }
-        
-        .status-text {
-            font-size: 0.9rem; color: #ffffff; font-weight: 300;
-        }
-        
-        .control-button {
-            background: #ffffff; color: #000000; border: none;
-            padding: 8px 16px; border-radius: 5px; cursor: pointer;
-            font-size: 0.8rem; font-weight: 600; letter-spacing: 0.5px;
-            transition: all 0.2s ease;
-        }
-        
-        .control-button:hover { background: #cccccc; }
-        
-        .control-button.danger {
-            background: #ff0000; color: #ffffff;
-        }
-        
-        .control-button.danger:hover { background: #cc0000; }
-        
-        /* Responsive */
-        @media (max-width: 1200px) {
-            .main-container { grid-template-columns: 1fr 1fr; }
-            .logs-section { display: none; }
-        }
-        
-        @media (max-width: 768px) {
-            .main-container { grid-template-columns: 1fr; }
-            .group-badge { position: relative; top: 0; right: 0; margin: 10px auto; }
-            .status-panel { flex-direction: column; gap: 10px; }
-        }
-        
-        .loading-spinner {
-            border: 2px solid #333333;
-            border-top: 2px solid #ffffff;
-            border-radius: 50%;
-            width: 20px; height: 20px;
-            animation: spin 1s linear infinite;
-        }
-        
-        @keyframes spin {
-            0% { transform: rotate(0deg); }
-            100% { transform: rotate(360deg); }
-        }
-    </style>
-</head>
-<body>
-    <div class="group-badge">GROUP 07</div>
-    
-    <div class="header">
-        <h1>UR5e SEQUENCE BOARD GAME</h1>
-        <div class="subtitle">Hand Safety System | Programming Autonomous Robots</div>
-    </div>
-
-    <div class="main-container">
-        <!-- Game Board Section -->
-        <div class="section">
-            <div class="section-title">GAME BOARD</div>
-            <div class="gameboard-frame">
-                <div class="gameboard-container">
-                    <img src="/gameboard-1.png" alt="Game Board Top Half" class="gameboard-half" 
-                         onerror="this.style.display='none'; document.getElementById('board-error-1').style.display='flex';">
-                    <div id="board-error-1" class="image-error" style="display: none;">
-                        gameboard-1.png not found
-                    </div>
-                    
-                    <div class="gameboard-spacer"></div>
-                    
-                    <img src="/gameboard-2.png" alt="Game Board Bottom Half" class="gameboard-half"
-                         onerror="this.style.display='none'; document.getElementById('board-error-2').style.display='flex';">
-                    <div id="board-error-2" class="image-error" style="display: none;">
-                        gameboard-2.png not found
-                    </div>
-                </div>
-            </div>
-        </div>
-
-        <!-- Camera Feed Section -->
-        <div class="section">
-            <div class="section-title">LIVE CAMERA FEED</div>
-            <div class="camera-container">
-                <img id="cameraFeed" class="camera-feed" style="display: none;" alt="Live Camera Feed">
-                <div id="cameraPlaceholder" class="camera-placeholder">
-                    <div class="loading-spinner"></div>
-                    <div>Waiting for camera frames...</div>
-                    <div style="font-size: 0.8rem; color: #555;">Check browser console for errors</div>
-                </div>
-                <div id="cameraStatus" class="camera-status live">● LIVE</div>
-            </div>
-        </div>
-
-        <!-- Live Logs Section -->
-        <div class="logs-section">
-            <div class="logs-header">LIVE SYSTEM LOGS</div>
-            <div class="logs-container" id="logsContainer">
-                <div class="log-entry info">
-                    <div class="log-timestamp">--:--:--</div>
-                    <div class="log-title">System Ready</div>
-                    <div class="log-message">Waiting for initialization...</div>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <!-- Status Panel -->
-    <div class="status-panel">
-        <div class="status-left">
-            <div class="status-indicator" id="safetyIndicator"></div>
-            <div class="status-text" id="safetyStatus">System Ready</div>
-            <div class="status-text">FPS: <span id="cameraFps">0</span></div>
-            <div class="status-text">Mode: <span id="robotMode">Idle</span></div>
-        </div>
-        
-        <div class="status-right">
-            <button class="control-button" onclick="startMonitoring()">START</button>
-            <button class="control-button danger" onclick="emergencyStop()">STOP</button>
-        </div>
-    </div>
-
-    <script>
-        // WebSocket connection
-        const socket = io();
-        let cameraFeed = document.getElementById('cameraFeed');
-        let cameraPlaceholder = document.getElementById('cameraPlaceholder');
-        let logsContainer = document.getElementById('logsContainer');
-        let frameReceived = false;
-
-        // Debug logging
-        console.log('🤖 UR5e Board Game System - Group 07');
-        console.log('🔗 Connecting to WebSocket...');
-
-        // Socket event handlers
-        socket.on('connect', function() {
-            console.log('✅ Connected to UR5e system');
-            updateStatus('Connected');
-            addLog('🔗 Connected', 'WebSocket connection established', 'success');
-        });
-
-        socket.on('disconnect', function() {
-            console.log('❌ Disconnected from system');
-            addLog('❌ Disconnected', 'Connection lost', 'error');
-        });
-
-        socket.on('camera_frame', function(data) {
-            console.log('📹 Received camera frame');
-            
-            // Show camera feed and hide placeholder
-            if (!frameReceived) {
-                cameraPlaceholder.style.display = 'none';
-                cameraFeed.style.display = 'block';
-                frameReceived = true;
-                console.log('✅ Camera feed activated');
-                addLog('📹 Camera Active', 'Live video feed streaming', 'success');
-            }
-            
-            // Update camera feed
-            cameraFeed.src = 'data:image/jpeg;base64,' + data.frame;
-        });
-
-        socket.on('status_update', function(data) {
-            document.getElementById('cameraFps').textContent = data.camera_fps || 0;
-            document.getElementById('robotMode').textContent = data.robot_mode || 'Idle';
-        });
-
-        socket.on('hazard_alert', function(data) {
-            // Show hazard status
-            document.getElementById('safetyIndicator').classList.add('hazard');
-            document.getElementById('safetyStatus').textContent = 'HAZARD DETECTED';
-            document.getElementById('cameraStatus').textContent = '⚠️ HAZARD';
-            document.getElementById('cameraStatus').className = 'camera-status hazard';
-            console.log('🚨 HAZARD:', data.message);
-        });
-
-        socket.on('hazard_clear', function(data) {
-            // Clear hazard status
-            document.getElementById('safetyIndicator').classList.remove('hazard');
-            document.getElementById('safetyStatus').textContent = 'Area Secure';
-            document.getElementById('cameraStatus').textContent = '● LIVE';
-            document.getElementById('cameraStatus').className = 'camera-status live';
-            console.log('✅ CLEAR:', data.message);
-        });
-
-        socket.on('log_message', function(data) {
-            addLog(data.title, data.message, data.type, data.timestamp);
-        });
-
-        // Add log entry to the live logs
-        function addLog(title, message, type = 'info', timestamp = null) {
-            if (!timestamp) {
-                timestamp = new Date().toLocaleTimeString();
-            }
-            
-            const logEntry = document.createElement('div');
-            logEntry.className = `log-entry ${type}`;
-            logEntry.innerHTML = `
-                <div class="log-timestamp">${timestamp}</div>
-                <div class="log-title">${title}</div>
-                <div class="log-message">${message}</div>
-            `;
-            
-            // Add to top of logs (newest first)
-            logsContainer.insertBefore(logEntry, logsContainer.firstChild);
-            
-            // Keep only last 50 logs
-            while (logsContainer.children.length > 50) {
-                logsContainer.removeChild(logsContainer.lastChild);
-            }
-        }
-
-        // Control functions
-        function startMonitoring() {
-            socket.emit('start_monitoring');
-            updateStatus('Monitoring Active');
-            console.log('🛡️ Monitoring started');
-            addLog('🛡️ Monitoring Started', 'Hand detection activated', 'success');
-        }
-
-        function emergencyStop() {
-            socket.emit('emergency_stop');
-            console.log('🛑 EMERGENCY STOP');
-            addLog('🛑 EMERGENCY STOP', 'Manual emergency stop activated', 'error');
-        }
-
-        function updateStatus(status) {
-            document.getElementById('safetyStatus').textContent = status;
-        }
-
-        // Debug camera issues
-        setTimeout(() => {
-            if (!frameReceived) {
-                console.log('⚠️ No camera frames received after 5 seconds');
-                console.log('🔍 Check if camera is being used by another app');
-                addLog('⚠️ Camera Issue', 'No frames received - check camera permissions', 'warning');
-            }
-        }, 5000);
-
-        // Auto-start monitoring
-        setTimeout(() => {
-            console.log('🚀 Auto-starting monitoring...');
-            socket.emit('start_monitoring');
-        }, 1000);
-    </script>
-</body>
-</html>
-"""
-
-@app.route('/')
-def index():
-    """Serve the main interface"""
-    return render_template_string(HTML_TEMPLATE)
+@app.route('/video_feed')
+def video_feed():
+    """Video streaming route"""
+    def generate():
+        while True:
+            frame = detector.get_frame()
+            if frame:
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n\r\n')
+            time.sleep(0.05)
+    return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
 @app.route('/api/status')
 def get_status():
-    """Get current robot status"""
-    return jsonify(robot_state)
+    """Get current system status"""
+    return jsonify(system_state)
 
-# WebSocket event handlers
-@socketio.on('connect')
-def handle_connect():
-    print('🔗 Web client connected')
-    emit('status_update', robot_state)
+@app.route('/api/start_detection', methods=['POST'])
+def start_detection():
+    """Start detection via HTTP"""
+    detector.start_detection()
+    return jsonify({'status': 'started', 'message': 'Hand detection started'})
 
-@socketio.on('start_monitoring')
-def handle_start_monitoring():
-    print('🛡️ Starting hand safety monitoring...')
-    safety_monitor.start_monitoring()
-    robot_state['game_state'] = 'monitoring_active'
-    robot_state['robot_mode'] = 'monitoring'
-    emit('status_update', robot_state)
+@app.route('/api/stop_detection', methods=['POST'])
+def stop_detection():
+    """Stop detection via HTTP"""
+    detector.stop_detection()
+    return jsonify({'status': 'stopped', 'message': 'Hand detection stopped'})
 
-@socketio.on('emergency_stop')
-def handle_emergency_stop():
-    print('🚨 EMERGENCY STOP ACTIVATED')
-    robot_state['safety_status'] = 'emergency_stop'
-    robot_state['robot_mode'] = 'emergency_stopped'
+@app.route('/api/emergency_stop', methods=['POST'])
+def emergency_stop():
+    """Emergency stop via HTTP"""
+    detector.stop_detection()
+    system_state['safety_status'] = 'emergency_stop'
+    detector.add_log('🛑 EMERGENCY STOP', 'Manual emergency stop activated', 'error')
+    return jsonify({'status': 'emergency_stopped', 'message': 'Emergency stop activated'})
+
+@app.route('/')
+def index():
+    """Main interface"""
+    return render_template_string("""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>UR5e Hand Detection - Group 07</title>
+        <style>
+            * { margin: 0; padding: 0; box-sizing: border-box; }
+            body { 
+                font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+                background: #000; color: #fff; min-height: 100vh;
+            }
+            .header { 
+                text-align: center; padding: 20px; background: #111;
+                border-bottom: 2px solid #333;
+            }
+            .header h1 { 
+                font-size: 2.2rem; font-weight: 300; margin-bottom: 8px;
+                color: #fff; letter-spacing: 2px;
+            }
+            .subtitle { 
+                font-size: 1rem; color: #888; font-weight: 300;
+            }
+            .group-badge {
+                position: absolute; top: 20px; right: 20px;
+                background: #fff; color: #000; padding: 10px 20px;
+                border-radius: 25px; font-weight: 700; font-size: 0.9rem;
+            }
+            .main-grid {
+                display: grid; grid-template-columns: 1fr 1fr 350px; gap: 2px;
+                min-height: calc(100vh - 200px); background: #333;
+            }
+            .panel {
+                background: #000; padding: 30px; display: flex;
+                flex-direction: column; align-items: center; justify-content: center;
+            }
+            .panel-title {
+                font-size: 1.3rem; font-weight: 300; margin-bottom: 25px;
+                color: #fff; letter-spacing: 1px; text-align: center;
+            }
+            
+            .gameboard-frame {
+                width: 100%; max-width: 420px; 
+                background: #fff; border-radius: 15px; padding: 25px;
+                box-shadow: 0 8px 30px rgba(255,255,255,0.1);
+            }
+            .gameboard-container {
+                background: #000; border-radius: 10px; overflow: hidden;
+            }
+            .gameboard-half {
+                width: 100%; height: auto; display: block;
+            }
+            .gameboard-spacer {
+                height: 10px; background: #fff;
+            }
+            .image-error {
+                height: 150px; background: #222; border: 1px solid #444;
+                display: flex; align-items: center; justify-content: center;
+                color: #666; font-size: 0.8rem; margin: 3px 0;
+            }
+            
+            .camera-container {
+                width: 100%; max-width: 420px; background: #111;
+                border-radius: 15px; overflow: hidden; border: 2px solid #333;
+                position: relative;
+            }
+            .camera-feed {
+                width: 100%; height: auto; display: block;
+            }
+            .camera-status {
+                position: absolute; top: 15px; left: 15px;
+                background: rgba(255, 255, 0, 0.8); padding: 8px 15px;
+                border-radius: 8px; font-size: 0.85rem; font-weight: 600;
+            }
+            .camera-status.monitoring {
+                background: rgba(0, 255, 0, 0.8);
+            }
+            .camera-status.hazard {
+                background: rgba(255, 0, 0, 0.8);
+                animation: pulse 1s infinite;
+            }
+            @keyframes pulse {
+                0%, 100% { opacity: 1; }
+                50% { opacity: 0.6; }
+            }
+            
+            .logs-panel {
+                background: #000; padding: 25px; display: flex;
+                flex-direction: column; max-height: calc(100vh - 200px); overflow: hidden;
+            }
+            .logs-header {
+                font-size: 1.1rem; font-weight: 400; margin-bottom: 20px;
+                color: #fff; text-align: center; border-bottom: 1px solid #333;
+                padding-bottom: 15px;
+            }
+            .logs-container {
+                flex: 1; overflow-y: auto;
+            }
+            .log-entry {
+                margin-bottom: 12px; padding: 15px; border-radius: 10px;
+                border-left: 4px solid; font-size: 0.9rem; line-height: 1.5;
+                animation: slideIn 0.4s ease-out;
+            }
+            .log-entry.success {
+                background: rgba(0, 255, 0, 0.1); border-color: #0f0; color: #ccffcc;
+            }
+            .log-entry.error {
+                background: rgba(255, 0, 0, 0.1); border-color: #f00; color: #ffcccc;
+            }
+            .log-entry.warning {
+                background: rgba(255, 255, 0, 0.1); border-color: #ff0; color: #ffffcc;
+            }
+            .log-entry.info {
+                background: rgba(0, 150, 255, 0.1); border-color: #09f; color: #ccddff;
+            }
+            .log-timestamp {
+                font-size: 0.75rem; opacity: 0.7; float: right;
+            }
+            .log-title {
+                font-weight: 600; margin-bottom: 5px;
+            }
+            @keyframes slideIn {
+                from { opacity: 0; transform: translateX(20px); }
+                to { opacity: 1; transform: translateX(0); }
+            }
+            
+            .status-bar {
+                position: fixed; bottom: 0; left: 0; right: 0;
+                background: #111; border-top: 2px solid #333; padding: 20px;
+                display: flex; justify-content: space-between; align-items: center;
+                z-index: 1000;
+            }
+            .status-left, .status-right {
+                display: flex; align-items: center; gap: 25px;
+            }
+            .status-indicator {
+                width: 12px; height: 12px; border-radius: 50%;
+                background: #ff0; animation: blink 2s infinite;
+            }
+            .status-indicator.monitoring {
+                background: #0f0;
+            }
+            .status-indicator.hazard {
+                background: #f00; animation: fastBlink 0.5s infinite;
+            }
+            @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+            @keyframes fastBlink { 0%, 100% { opacity: 1; } 50% { opacity: 0.2; } }
+            .status-text {
+                font-size: 1rem; color: #fff; font-weight: 400;
+            }
+            .control-btn {
+                background: #fff; color: #000; border: none;
+                padding: 12px 20px; border-radius: 8px; cursor: pointer;
+                font-size: 0.9rem; font-weight: 600; letter-spacing: 0.5px;
+                transition: all 0.3s ease;
+            }
+            .control-btn:hover { background: #ddd; transform: scale(1.05); }
+            .control-btn.danger {
+                background: #f00; color: #fff;
+            }
+            .control-btn.danger:hover { background: #c00; }
+            
+            @media (max-width: 1200px) {
+                .main-grid { grid-template-columns: 1fr 1fr; }
+                .logs-panel { display: none; }
+            }
+            @media (max-width: 768px) {
+                .main-grid { grid-template-columns: 1fr; }
+                .status-bar { flex-direction: column; gap: 15px; }
+            }
+        </style>
+    </head>
+    <body>
+        <div class="group-badge">GROUP 07</div>
+        
+        <div class="header">
+            <h1>UR5e SEQUENCE BOARD GAME</h1>
+            <div class="subtitle">HTTP-Based Hand Detection System</div>
+        </div>
+
+        <div class="main-grid">
+            <div class="panel">
+                <div class="panel-title">GAME BOARD</div>
+                <div class="gameboard-frame">
+                    <div class="gameboard-container">
+                        <img src="/gameboard-1.png" alt="Board Top" class="gameboard-half" 
+                             onerror="this.style.display='none'; document.getElementById('err1').style.display='flex';">
+                        <div id="err1" class="image-error" style="display:none;">gameboard-1.png missing</div>
+                        
+                        <div class="gameboard-spacer"></div>
+                        
+                        <img src="/gameboard-2.png" alt="Board Bottom" class="gameboard-half"
+                             onerror="this.style.display='none'; document.getElementById('err2').style.display='flex';">
+                        <div id="err2" class="image-error" style="display:none;">gameboard-2.png missing</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="panel">
+                <div class="panel-title">LIVE HAND DETECTION</div>
+                <div class="camera-container">
+                    <img src="/video_feed" class="camera-feed" alt="Live Hand Detection" />
+                    <div class="camera-status" id="cameraStatus">● DETECTION DISABLED</div>
+                </div>
+            </div>
+
+            <div class="logs-panel">
+                <div class="logs-header">SYSTEM LOGS</div>
+                <div class="logs-container" id="logsContainer">
+                    <!-- Logs will be populated by JavaScript -->
+                </div>
+            </div>
+        </div>
+
+        <div class="status-bar">
+            <div class="status-left">
+                <div class="status-indicator" id="safetyIndicator"></div>
+                <div class="status-text" id="safetyStatus">Detection Disabled</div>
+                <div class="status-text">FPS: <span id="cameraFps">0</span></div>
+                <div class="status-text">Hazards: <span id="hazardsCount">0</span></div>
+            </div>
+            
+            <div class="status-right">
+                <button class="control-btn" id="startBtn" onclick="startDetection()">START DETECTION</button>
+                <button class="control-btn" id="stopBtn" onclick="stopDetection()" style="display:none;">STOP DETECTION</button>
+                <button class="control-btn danger" onclick="emergencyStop()">EMERGENCY STOP</button>
+            </div>
+        </div>
+
+        <script>
+            let logsContainer = document.getElementById('logsContainer');
+
+            // Update system status every second
+            function updateStatus() {
+                fetch('/api/status')
+                    .then(response => response.json())
+                    .then(data => {
+                        // Update FPS and hazards count
+                        document.getElementById('cameraFps').textContent = data.camera_fps || 0;
+                        document.getElementById('hazardsCount').textContent = data.hazards_detected || 0;
+                        
+                        // Update status indicator and text
+                        const indicator = document.getElementById('safetyIndicator');
+                        const statusText = document.getElementById('safetyStatus');
+                        const cameraStatus = document.getElementById('cameraStatus');
+                        
+                        indicator.className = 'status-indicator';
+                        cameraStatus.className = 'camera-status';
+                        
+                        if (!data.detection_enabled) {
+                            statusText.textContent = 'Detection Disabled';
+                            cameraStatus.textContent = '● DETECTION DISABLED';
+                            document.getElementById('startBtn').style.display = 'inline-block';
+                            document.getElementById('stopBtn').style.display = 'none';
+                        } else if (data.hazard_detected) {
+                            indicator.classList.add('hazard');
+                            cameraStatus.classList.add('hazard');
+                            statusText.textContent = 'HAND HAZARD DETECTED';
+                            cameraStatus.textContent = '🚨 HAND HAZARD';
+                        } else {
+                            indicator.classList.add('monitoring');
+                            cameraStatus.classList.add('monitoring');
+                            statusText.textContent = 'Hand Detection Active';
+                            cameraStatus.textContent = '● HAND DETECTION';
+                            document.getElementById('startBtn').style.display = 'none';
+                            document.getElementById('stopBtn').style.display = 'inline-block';
+                        }
+                        
+                        // Update logs
+                        updateLogs(data.logs || []);
+                    })
+                    .catch(error => {
+                        console.error('Status update failed:', error);
+                    });
+            }
+
+            function updateLogs(logs) {
+                logsContainer.innerHTML = '';
+                logs.forEach(log => {
+                    const logEntry = document.createElement('div');
+                    logEntry.className = `log-entry ${log.type}`;
+                    logEntry.innerHTML = `
+                        <div class="log-timestamp">${log.timestamp}</div>
+                        <div class="log-title">${log.title}</div>
+                        <div class="log-message">${log.message}</div>
+                    `;
+                    logsContainer.appendChild(logEntry);
+                });
+            }
+
+            function startDetection() {
+                console.log('🔄 Starting detection...');
+                fetch('/api/start_detection', { method: 'POST' })
+                    .then(response => response.json())
+                    .then(data => {
+                        console.log('✅ Detection started:', data);
+                    })
+                    .catch(error => {
+                        console.error('Start detection failed:', error);
+                    });
+            }
+
+            function stopDetection() {
+                console.log('🔄 Stopping detection...');
+                fetch('/api/stop_detection', { method: 'POST' })
+                    .then(response => response.json())
+                    .then(data => {
+                        console.log('✅ Detection stopped:', data);
+                    })
+                    .catch(error => {
+                        console.error('Stop detection failed:', error);
+                    });
+            }
+
+            function emergencyStop() {
+                console.log('🚨 Emergency stop...');
+                fetch('/api/emergency_stop', { method: 'POST' })
+                    .then(response => response.json())
+                    .then(data => {
+                        console.log('🚨 Emergency stop activated:', data);
+                    })
+                    .catch(error => {
+                        console.error('Emergency stop failed:', error);
+                    });
+            }
+
+            // Start status updates
+            setInterval(updateStatus, 1000);
+            updateStatus(); // Initial update
+
+            console.log('🤖 UR5e Hand Detection System - Group 07');
+            console.log('✅ HTTP-based system loaded successfully');
+        </script>
+    </body>
+    </html>
+    """)
+
+def main():
+    print("🚀 UR5e HTTP-Based Hand Detection - Group 07")
+    print("🎮 Web Interface: http://localhost:5555")
+    print("✋ Hand Detection: YOLOv8s (Small) Model")
+    print("📹 Reliable communication without WebSocket issues")
     
-    socketio.emit('hazard_alert', {
-        'type': 'emergency_stop',
-        'message': 'Emergency stop activated',
-        'timestamp': datetime.now().strftime("%H:%M:%S")
-    })
-
-def start_server():
-    """Start the web server on port 5555"""
-    print("🚀 UR5e Board Game System - Group 07")
-    print("🎮 Interface: http://localhost:5555")
-    print("🛡️ Hand Safety: Debug mode with live logs")
-    print("📷 Camera: Enhanced frame emission debugging")
-    print("🎯 Gameboards: Styled with white frame and spacing")
+    if os.path.exists('yolov8s.pt'):
+        print("✅ Found local yolov8s.pt model")
+    else:
+        print("📥 Will download YOLOv8s model on first run")
     
-    # Check if gameboard images exist
     for i in [1, 2]:
         filename = f'gameboard-{i}.png'
         if os.path.exists(filename):
             print(f"✅ Found: {filename}")
         else:
-            print(f"⚠️  Missing: {filename} (place in same directory)")
+            print(f"⚠️ Missing: {filename}")
     
     print("-" * 60)
-    print("🔍 DEBUG: Watch browser console for camera frame logs")
-    print("📊 LOGS: Live system logs now visible in web interface")
+    print("💡 USAGE:")
+    print("1. Run: python ur5e_hand_detection_http.py")
+    print("2. Open: http://localhost:5555")
+    print("3. Click 'START DETECTION'")
+    print("4. Wave hands to see RED bounding boxes")
+    print("-" * 60)
     
-    # Start the server on port 5555
-    socketio.run(app, host='0.0.0.0', port=5555, debug=False, allow_unsafe_werkzeug=True)
+    try:
+        app.run(host='0.0.0.0', port=5555, debug=False)
+    except KeyboardInterrupt:
+        print("\n🛑 Shutting down...")
+        detector.stop()
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        detector.stop()
 
 if __name__ == '__main__':
-    start_server()
+    main()
