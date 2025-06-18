@@ -55,27 +55,40 @@ class SequenceGameTrueLogic:
         self.selected_card = None
         self.turn = 1  # Start with human
         self.create_widgets()
-        self.assign_board_labels()
+        self.assign_fixed_labels_rotated()
         self.start_game()
 
     def create_blocks(self):
-        labels = [f"{chr(65 + i)}{j+1}" for i in range(4) for j in range(4)]  # A1 to D4
+        labels = [
+            "C1", "C2", "C3", "C4", "C5",
+            "B1", "B2", "B3", "B4", "B5",
+            "A1", "A2", "A3",
+            "D1", "D2", "D3"
+        ]  # Excludes corners
         random.shuffle(labels)
         self.blocks = [Block(label, f"QR_{label}") for label in labels]
 
-    def assign_board_labels(self):
-        # Assign the 16 alphanumeric labels to non-corner tiles
-        available_positions = [(i, j) for i in range(4) for j in range(5) if (i, j) not in self.board.wild_positions]
-        labels = [f"{chr(65 + i)}{j+1}" for i in range(4) for j in range(4)]  # A1 to D4
-        random.shuffle(labels)
-        for pos, label in zip(available_positions, labels):
-            i, j = pos
-            self.board.label_map[i][j] = label
-            self.buttons[i][j].config(text=label)
+    def assign_fixed_labels_rotated(self):
+        # Fixed 90-degree rotated label layout
+        fixed_labels = [
+            [None, "C1", "B1", None,],
+            ["D1", "C2", "B2", "A1",],
+            ["D2", "C3", "B3", "A2",],
+            ["D3", "C4", "B4", "A3",],
+            [None, "C5", "B5", None,]
+        ]
 
-        # Mark wild positions
-        for i, j in self.board.wild_positions:
-            self.buttons[i][j].config(text="SEQ", bg="gray")
+        # Rotate back to [4x5] format (transposed into grid[i][j])
+        rotated = list(zip(*fixed_labels[::-1]))  # 4 rows x 5 cols
+
+        for i in range(4):
+            for j in range(5):
+                label = rotated[i][j]
+                if (i, j) in self.board.wild_positions:
+                    self.buttons[i][j].config(text="SEQ", bg="gray")
+                elif label:
+                    self.board.label_map[i][j] = label
+                    self.buttons[i][j].config(text=label)
 
     def create_widgets(self):
         self.buttons = []
@@ -105,15 +118,19 @@ class SequenceGameTrueLogic:
     def update_hand_buttons(self):
         for widget in self.card_buttons_frame.winfo_children():
             widget.destroy()
-        for idx, card in enumerate(self.human.hand):
+
+        for card in self.human.hand:
             btn = tk.Button(self.card_buttons_frame, text=card.card_label,
                             font=('Arial', 12), width=10,
-                            command=lambda i=idx: self.select_card(i))
+                            command=lambda c=card: self.select_card(c))
             btn.pack(side='left', padx=10)
 
-    def select_card(self, index):
-        self.selected_card = self.human.hand.pop(index)
-        self.status_label.config(text=f"Selected: {self.selected_card.card_label}. Now click its matching tile.")
+    def select_card(self, card):
+        if card in self.human.hand:
+            self.human.hand.remove(card)
+            self.selected_card = card
+            self.update_hand_buttons()
+            self.status_label.config(text=f"Selected: {self.selected_card.card_label}. Now click its matching tile.")
 
     def handle_click(self, i, j):
         if self.turn % 2 == 1 and self.selected_card:
@@ -165,12 +182,12 @@ class SequenceGameTrueLogic:
         self.turn += 1
         self.status_label.config(text="Your turn! Select a card and click its matching tile.")
 
-
     def place_piece(self, i, j, player, label):
         self.board.grid[i][j] = player.symbol
         self.buttons[i][j].config(text=label, bg=player.color, state='disabled')
 
 
+# Launch the game
 if __name__ == "__main__":
     root = tk.Tk()
     app = SequenceGameTrueLogic(root)
