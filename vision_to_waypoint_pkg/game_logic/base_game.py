@@ -4,97 +4,53 @@ import random
 # --- Game Data Classes ---
 
 class Block:
-    def __init__(self, card_label, qr_code):
+    def __init__(self, card_label):
         self.card_label = card_label
-        self.qr_code = qr_code
-        self.used = False
 
 class Player:
     def __init__(self, name, symbol, color):
         self.name = name
-        self.hand = []
         self.symbol = symbol
         self.color = color
+        self.hand = []
 
 class GameBoard:
     def __init__(self):
-        self.grid = [['' for _ in range(5)] for _ in range(4)]
-        self.label_map = [['' for _ in range(5)] for _ in range(4)]
-        self.wild_positions = {(0,0), (0,4), (3,0), (3,4)}
+        self.rows = 5
+        self.cols = 4
+        self.grid = [['' for _ in range(self.cols)] for _ in range(self.rows)]
+        self.label_map = [['' for _ in range(self.cols)] for _ in range(self.rows)]
+        self.wild_positions = {(0,0), (0,3), (4,0), (4,3)}
 
-# --- Game Logic ---
-
-def check_win(board, symbol):
-    grid = board.grid
-    for i in range(4):
-        for j in range(3):
-            if grid[i][j] == grid[i][j+1] == grid[i][j+2] == symbol:
-                return True
-    for i in range(2):
-        for j in range(5):
-            if grid[i][j] == grid[i+1][j] == grid[i+2][j] == symbol:
-                return True
-    for i in range(2):
-        for j in range(3):
-            if grid[i][j] == grid[i+1][j+1] == grid[i+2][j+2] == symbol:
-                return True
-            if grid[i+2][j] == grid[i+1][j+1] == grid[i][j+2] == symbol:
-                return True
-    return False
-
-# --- GUI Logic ---
-
-class SequenceGameTrueLogic:
+class SequenceGame:
     def __init__(self, root):
         self.root = root
         self.root.title("Sequence Game: Human vs Robot")
         self.board = GameBoard()
-        self.create_blocks()
+        self.buttons = []
+        self.selected_card = None
+        self.turn = 1
+
         self.robot = Player("Robot", "R", "lightblue")
         self.human = Player("Human", "H", "lightgreen")
-        self.selected_card = None
-        self.turn = 1  # Start with human
-        self.create_widgets()
-        self.assign_fixed_labels_rotated()
-        self.start_game()
 
-    def create_blocks(self):
-        labels = [
-            "C1", "C2", "C3", "C4", "C5",
-            "B1", "B2", "B3", "B4", "B5",
-            "A1", "A2", "A3",
-            "D1", "D2", "D3"
-        ]  # Excludes corners
-        random.shuffle(labels)
-        self.blocks = [Block(label, f"QR_{label}") for label in labels]
-
-    def assign_fixed_labels_rotated(self):
-        # Fixed 90-degree rotated label layout
-        fixed_labels = [
-            [None, "C1", "B1", None,],
-            ["D1", "C2", "B2", "A1",],
-            ["D2", "C3", "B3", "A2",],
-            ["D3", "C4", "B4", "A3",],
-            [None, "C5", "B5", None,]
+        self.fixed_labels = [
+            ["SEQ", "A1", "A2", "SEQ"],
+            ["B1", "B2", "B3", "B4"],
+            ["C1", "C2", "C3", "C4"],
+            ["D1", "D2", "D3", "D4"],
+            ["SEQ", "E1", "E2", "SEQ"]
         ]
 
-        # Rotate back to [4x5] format (transposed into grid[i][j])
-        rotated = list(zip(*fixed_labels[::-1]))  # 4 rows x 5 cols
-
-        for i in range(4):
-            for j in range(5):
-                label = rotated[i][j]
-                if (i, j) in self.board.wild_positions:
-                    self.buttons[i][j].config(text="SEQ", bg="gray")
-                elif label:
-                    self.board.label_map[i][j] = label
-                    self.buttons[i][j].config(text=label)
+        self.create_widgets()
+        self.assign_fixed_labels()
+        self.create_deck()
+        self.start_game()
 
     def create_widgets(self):
-        self.buttons = []
-        for i in range(4):
+        for i in range(self.board.rows):
             row = []
-            for j in range(5):
+            for j in range(self.board.cols):
                 btn = tk.Button(self.root, text="", width=8, height=4,
                                 font=('Arial', 12, 'bold'),
                                 command=lambda i=i, j=j: self.handle_click(i, j))
@@ -103,22 +59,41 @@ class SequenceGameTrueLogic:
             self.buttons.append(row)
 
         self.status_label = tk.Label(self.root, text="", font=('Arial', 14))
-        self.status_label.grid(row=5, column=0, columnspan=5)
+        self.status_label.grid(row=self.board.rows, column=0, columnspan=self.board.cols)
 
         self.card_buttons_frame = tk.Frame(self.root)
-        self.card_buttons_frame.grid(row=6, column=0, columnspan=5)
+        self.card_buttons_frame.grid(row=self.board.rows+1, column=0, columnspan=self.board.cols)
+
+    def assign_fixed_labels(self):
+        for i in range(self.board.rows):
+            for j in range(self.board.cols):
+                label = self.fixed_labels[i][j]
+                self.board.label_map[i][j] = label
+                if (i, j) in self.board.wild_positions:
+                    self.buttons[i][j].config(text="SEQ", bg="gray")
+                else:
+                    self.buttons[i][j].config(text=label)
+
+    def create_deck(self):
+        labels = []
+        for i in range(self.board.rows):
+            for j in range(self.board.cols):
+                label = self.fixed_labels[i][j]
+                if label != "SEQ":
+                    labels.append(label)
+        random.shuffle(labels)
+        self.deck = [Block(label) for label in labels]
 
     def start_game(self):
         for _ in range(2):
-            self.robot.hand.append(self.blocks.pop())
-            self.human.hand.append(self.blocks.pop())
+            self.human.hand.append(self.deck.pop())
+            self.robot.hand.append(self.deck.pop())
         self.update_hand_buttons()
-        self.status_label.config(text="Your turn! Select a card and click its matching tile.")
+        self.status_label.config(text="Your turn! Select a card and click its tile.")
 
     def update_hand_buttons(self):
         for widget in self.card_buttons_frame.winfo_children():
             widget.destroy()
-
         for card in self.human.hand:
             btn = tk.Button(self.card_buttons_frame, text=card.card_label,
                             font=('Arial', 12), width=10,
@@ -130,65 +105,76 @@ class SequenceGameTrueLogic:
             self.human.hand.remove(card)
             self.selected_card = card
             self.update_hand_buttons()
-            self.status_label.config(text=f"Selected: {self.selected_card.card_label}. Now click its matching tile.")
+            self.status_label.config(text=f"Selected: {card.card_label}. Now click its matching tile.")
 
     def handle_click(self, i, j):
-        if self.turn % 2 == 1 and self.selected_card:
-            if self.board.grid[i][j] != '':
-                self.status_label.config(text="Tile already occupied.")
-                return
-            if self.board.label_map[i][j] != self.selected_card.card_label and (i, j) not in self.board.wild_positions:
-                self.status_label.config(text="Incorrect tile for selected card.")
-                return
-            self.place_piece(i, j, self.human, self.selected_card.card_label)
-            self.selected_card = None
-            if check_win(self.board, self.human.symbol):
-                self.status_label.config(text="You Win!")
-                return
-            if self.blocks:
-                self.human.hand.append(self.blocks.pop())
-            self.update_hand_buttons()
-            self.turn += 1
-            self.root.after(1000, self.robot_turn)
+        if not self.selected_card:
+            return
+        if self.board.grid[i][j] != "":
+            self.status_label.config(text="Tile already occupied.")
+            return
+        if (i, j) in self.board.wild_positions:
+            self.status_label.config(text="Cannot place on SEQ tile.")
+            return
+        expected = self.board.label_map[i][j]
+        if expected != self.selected_card.card_label:
+            self.status_label.config(text="Wrong tile.")
+            return
+        self.place_piece(i, j, self.human, self.selected_card.card_label)
+        self.selected_card = None
+        if self.check_win(self.human.symbol):
+            self.status_label.config(text="You Win!")
+            return
+        if self.deck:
+            self.human.hand.append(self.deck.pop())
+        self.update_hand_buttons()
+        self.turn += 1
+        self.root.after(1000, self.robot_turn)
 
     def robot_turn(self):
+        card = self.robot.hand.pop(0)
         placed = False
-        chosen = self.robot.hand.pop(0)
-
-        # Step 1: Try placing on an exact matching card label tile
-        for i in range(4):
-            for j in range(5):
-                if self.board.grid[i][j] == '' and self.board.label_map[i][j] == chosen.card_label:
-                    self.place_piece(i, j, self.robot, chosen.card_label)
+        for i in range(self.board.rows):
+            for j in range(self.board.cols):
+                if (i, j) not in self.board.wild_positions and \
+                   self.board.grid[i][j] == "" and \
+                   self.board.label_map[i][j] == card.card_label:
+                    self.place_piece(i, j, self.robot, card.card_label)
                     placed = True
                     break
             if placed:
                 break
-
-        # Step 2: If no exact match, try placing on a SEQ tile
-        if not placed:
-            for i, j in self.board.wild_positions:
-                if self.board.grid[i][j] == '':
-                    self.place_piece(i, j, self.robot, chosen.card_label)
-                    placed = True
-                    break
-
-        # Step 3: Finish turn
-        if check_win(self.board, self.robot.symbol):
+        if placed and self.check_win(self.robot.symbol):
             self.status_label.config(text="Robot Wins!")
             return
-        if self.blocks:
-            self.robot.hand.append(self.blocks.pop())
+        if self.deck:
+            self.robot.hand.append(self.deck.pop())
         self.turn += 1
-        self.status_label.config(text="Your turn! Select a card and click its matching tile.")
+        self.status_label.config(text="Your turn! Select a card and click its tile.")
 
     def place_piece(self, i, j, player, label):
         self.board.grid[i][j] = player.symbol
         self.buttons[i][j].config(text=label, bg=player.color, state='disabled')
 
+    def check_win(self, symbol):
+        g = self.board.grid
+        for i in range(self.board.rows):
+            for j in range(self.board.cols - 2):
+                if g[i][j] == symbol and g[i][j+1] == symbol and g[i][j+2] == symbol:
+                    return True
+        for i in range(self.board.rows - 2):
+            for j in range(self.board.cols):
+                if g[i][j] == symbol and g[i+1][j] == symbol and g[i+2][j] == symbol:
+                    return True
+        for i in range(self.board.rows - 2):
+            for j in range(self.board.cols - 2):
+                if g[i][j] == symbol and g[i+1][j+1] == symbol and g[i+2][j+2] == symbol:
+                    return True
+                if g[i+2][j] == symbol and g[i+1][j+1] == symbol and g[i][j+2] == symbol:
+                    return True
+        return False
 
 # Launch the game
-if __name__ == "__main__":
-    root = tk.Tk()
-    app = SequenceGameTrueLogic(root)
-    root.mainloop()
+root = tk.Tk()
+app = SequenceGame(root)
+root.mainloop()
